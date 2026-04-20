@@ -303,26 +303,36 @@ def ult_osc(h,l,c,s=7,m=14,lg=28):
 
 def compute_score(hist,sector=""):
     if hist is None or len(hist)<100: return None,{}
+
+    def safe_last(series):
+        """Return last non-NaN value or None — prevents iloc[-1] crashes on short/empty series."""
+        try:
+            s = series.dropna()
+            return float(s.iloc[-1]) if len(s) > 0 else None
+        except Exception:
+            return None
     c,h,l,v=hist["Close"],hist["High"],hist["Low"],hist["Volume"]
-    price=c.iloc[-1]; th=get_thresh(sector)
+    price = safe_last(c)
+    if price is None: return None,{}
+    th=get_thresh(sector)
     signals,raw,mx={},0,0
     def sig_ma(val): return 0 if pd.isna(val) or val==0 else(1 if price>val else -1)
     for name,series in [("EMA 10",ema(c,10)),("SMA 10",sma(c,10)),("EMA 20",ema(c,20)),("SMA 20",sma(c,20)),
         ("EMA 30",ema(c,30)),("SMA 30",sma(c,30)),("EMA 50",ema(c,50)),("SMA 50",sma(c,50)),
         ("EMA 100",ema(c,100)),("SMA 100",sma(c,100)),("EMA 200",ema(c,200)),("SMA 200",sma(c,200)),
         ("Ichimoku",ichimoku_base(h,l,26)),("VWMA 20",vwma(c,v,20)),("HMA 9",hma(c,9))]:
-        s=sig_ma(series.iloc[-1]); signals[name]=s; raw+=s; mx+=1
+        s=sig_ma(safe_last(series)); signals[name]=s; raw+=s; mx+=1
     def s_rsi(x): return 1 if x<th["rsi_os"] else(-1 if x>th["rsi_ob"] else 0)
     def s_cci(x): return 1 if x<th["cci_os"] else(-1 if x>th["cci_ob"] else 0)
     def s_wpr(x): return 1 if x<th["wpr_os"] else(-1 if x>th["wpr_ob"] else 0)
     def s_sign(x): return 0 if pd.isna(x) else(1 if x>0 else(-1 if x<0 else 0))
     adxv,pdi,mdi=adx_calc(h,l,c,14); ml,sig_l=macd_calc(c); w=1.5
     for name,s in [
-        ("RSI 14",    s_rsi(rsi_calc(c,14).iloc[-1])),
+        ("RSI 14",    s_rsi(safe_last(rsi_calc(c,14)))),
         ("Stoch %K",  (1 if stoch_k(h,l,c).iloc[-1]<20 else(-1 if stoch_k(h,l,c).iloc[-1]>80 else 0))),
-        ("CCI 20",    s_cci(cci(h,l,c).iloc[-1])),
+        ("CCI 20",    s_cci(safe_last(cci(h,l,c)))),
         ("ADX 14",    (1 if pdi.iloc[-1]>mdi.iloc[-1] else -1) if adxv.iloc[-1]>25 else 0),
-        ("Awe. Osc.", s_sign(awesome_osc(h,l).iloc[-1])),
+        ("Awe. Osc.", s_sign(safe_last(awesome_osc(h,l)))),
         ("Momentum",  s_sign(momentum_ind(c).iloc[-1])),
         ("MACD",      s_sign(ml.iloc[-1]-sig_l.iloc[-1])),
         ("Stoch RSI", (1 if stoch_rsi(c).iloc[-1]<0.2 else(-1 if stoch_rsi(c).iloc[-1]>0.8 else 0))),
@@ -499,7 +509,10 @@ def style_df(df):
                 "Underperform":"color:#e07b5c","Sell":"color:#e05c5c"}.get(v,"")
     styled=df.style
     for col,fn in [("Score",c_score),("Upside",c_up),("Consensus",c_con),("Signal",c_con)]:
-        if col in df.columns: styled=styled.applymap(fn,subset=[col])
+        if col in df.columns:
+            # pandas 2.1 renamed applymap → map; fall back for older versions
+            _stylefn = styled.map if hasattr(styled, 'map') else styled.applymap
+            styled = _stylefn(fn, subset=[col])
     return styled.set_properties(**{"background-color":"#111210","color":"#e8e4dc","border-color":"#1f2020",
         "font-family":"DM Mono, monospace","font-size":"12px"}).set_table_styles([
         {"selector":"th","props":[("background-color","#0b0a09"),("color","#6b6e6c"),("font-size","9px"),
@@ -1676,8 +1689,23 @@ def render_app():
             with st.spinner(f"Loading {t1} and {t2}…"):
                 data={}
                 for tk in [t1,t2]:
-                    info=get_info(tk); hist=get_hist(tk); sec=info.get("sector","")
-                    score,sigs=compute_score(hist,sec); data[tk]={"info":info,"hist":hist,"score":score,"signals":sigs,"sector":sec}
+                    info = get_info(tk)
+                    hist = get_hist(tk)
+                    sec  = (info.get("sector")
+                            or info.get("quoteType","")
+                            or "")
+                    try:
+                        score,sigs = compute_score(hist,sec)
+                    except Exception:
+                        score,sigs = None,{}
+                    # Fallback price from hist if info missing it
+                    if not info.get("currentPrice") and hist is not None:
+                        info["currentPrice"] = float(hist["Close"].iloc[-1])
+                    if not info.get("marketCap") and hist is not None:
+                        shares = info.get("sharesOutstanding")
+                        if shares:
+                            info["marketCap"] = float(hist["Close"].iloc[-1]) * shares
+                    data[tk]={"info":info,"hist":hist,"score":score,"signals":sigs,"sector":sec}
             st.markdown(f"""<div style="font-family:'Fraunces',serif;font-size:1.4rem;font-weight:300;color:#e8e4dc;margin-bottom:20px;">
                 {t1} <span style="color:#c8953a;">vs</span> {t2}</div>""",unsafe_allow_html=True)
             g1,g2=st.columns(2)
